@@ -3,7 +3,7 @@ import io
 import json
 import os
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import cv2
 import numpy as np
@@ -16,6 +16,8 @@ from google.genai import types
 
 app = FastAPI(title="Gemini Crop A4 Document API")
 
+# Mặc định A4 nhẹ hơn để chạy nhanh hơn.
+# Apps Script vẫn có thể truyền widthPx / heightPx để ghi đè.
 A4_WIDTH_PX = 1240
 A4_HEIGHT_PX = 1754
 
@@ -45,6 +47,7 @@ def crop_a4(payload: CropRequest):
             raise HTTPException(status_code=400, detail="Không đọc được ảnh.")
 
         output_options = payload.output or {}
+
         width_px = int(output_options.get("widthPx", A4_WIDTH_PX))
         height_px = int(output_options.get("heightPx", A4_HEIGHT_PX))
         enhance_text = bool(output_options.get("enhanceText", True))
@@ -139,7 +142,8 @@ def crop_document_with_gemini(
 
             return warped, True, "gemini_box", gemini_result
 
-    # Fallback an toàn: không crop bừa, đưa nguyên ảnh vào nền A4
+    # Fallback an toàn: nếu Gemini lỗi, quá tải, hoặc không chắc
+    # thì KHÔNG crop bừa. Đưa nguyên ảnh vào nền A4 để tránh mất nội dung.
     safe = fit_image_to_a4_canvas(image, output_width, output_height)
 
     if enhance_text:
@@ -168,21 +172,25 @@ def find_document_area_with_gemini(
 Bạn là hệ thống phát hiện vùng tài liệu trong ảnh chụp.
 
 Nhiệm vụ:
-- Tìm vùng tờ giấy / tài liệu chính trong ảnh.
-- Ưu tiên trả về 4 góc thật của tài liệu nếu nhìn thấy.
-- Không chọn nền bàn, tay, bóng đổ, màn hình, hoặc vật khác.
+- Tìm vùng tờ giấy hoặc tài liệu chính trong ảnh.
+- Ưu tiên trả về chính xác 4 góc thật của tài liệu nếu nhìn thấy đủ.
+- Không chọn nền bàn, tay, bóng đổ, màn hình, vật khác hoặc khung ngoài không phải tài liệu.
 - Nếu không chắc, document_found phải là false.
+- Nếu tài liệu bị nghiêng, hãy trả đúng 4 góc của tài liệu theo ảnh gốc.
+- Nếu chỉ thấy một phần tài liệu hoặc mép giấy không rõ, document_found=false.
 
 Ảnh có kích thước:
 width={image_width}
 height={image_height}
 
-Chỉ trả về JSON hợp lệ, không markdown, không giải thích.
+Chỉ trả về JSON hợp lệ.
+Không markdown.
+Không giải thích ngoài JSON.
 
 Schema:
 {{
-  "document_found": true hoặc false,
-  "confidence": số từ 0 đến 1,
+  "document_found": true,
+  "confidence": 0.0,
   "corners": [
     [x_top_left, y_top_left],
     [x_top_right, y_top_right],
@@ -193,48 +201,72 @@ Schema:
   "reason": "ngắn gọn"
 }}
 
-Yêu cầu tọa độ:
+Quy định tọa độ:
 - corners dùng tọa độ pixel thật theo ảnh gốc.
-- box_2d dùng tọa độ pixel thật theo ảnh gốc, thứ tự [ymin, xmin, ymax, xmax].
-- Nếu chỉ thấy một phần tài liệu hoặc không chắc mép giấy, document_found=false.
+- box_2d dùng tọa độ pixel thật theo ảnh gốc.
+- box_2d theo thứ tự [ymin, xmin, ymax, xmax].
+- Tọa độ x nằm trong khoảng 0 đến {image_width}.
+- Tọa độ y nằm trong khoảng 0 đến {image_height}.
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=[
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type=mime_type
-            ),
-            prompt
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0,
-            response_mime_type="application/json"
-        )
-    )
+    # Bạn có thể chỉnh danh sách này theo model tài khoản bạn dùng được.
+    # Nếu gemini-3.5-flash không tồn tại hoặc quá tải, code sẽ tự thử model tiếp theo.
+    models_to_try = [
+        "gemini-3.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash"
+    ]
 
-    text = response.text or "{}"
+    last_error = None
 
-    try:
-        data = json.loads(text)
-    except Exception:
-        data = parse_json_from_text(text)
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type=mime_type
+                    ),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json"
+                )
+            )
 
-    if not isinstance(data, dict):
-        return {
-            "document_found": False,
-            "reason": "Gemini returned invalid JSON",
-            "raw": text[:500]
-        }
+            text = response.text or "{}"
 
-    confidence = float(data.get("confidence", 0) or 0)
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = parse_json_from_text(text)
 
-    if confidence < 0.55:
-        data["document_found"] = False
-        data["reason"] = "Confidence too low: " + str(confidence)
+            if not isinstance(data, dict):
+                last_error = f"{model_name}: invalid JSON"
+                continue
 
-    return data
+            data["model_used"] = model_name
+
+            confidence = float(data.get("confidence", 0) or 0)
+
+            if confidence < 0.55:
+                data["document_found"] = False
+                data["reason"] = "Confidence too low: " + str(confidence)
+
+            return data
+
+        except Exception as exc:
+            last_error = f"{model_name}: {str(exc)}"
+            continue
+
+    return {
+        "document_found": False,
+        "reason": "All Gemini models unavailable or failed",
+        "last_error": str(last_error)
+    }
 
 
 def parse_json_from_text(text: str):
@@ -243,7 +275,10 @@ def parse_json_from_text(text: str):
     if not match:
         return {}
 
-    return json.loads(match.group(0))
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return {}
 
 
 def is_valid_corners(corners, image_width: int, image_height: int):
@@ -265,6 +300,45 @@ def is_valid_corners(corners, image_width: int, image_height: int):
     area = cv2.contourArea(points)
 
     if area < image_width * image_height * 0.08:
+        return False
+
+    if not is_reasonable_quad(points, image_width, image_height):
+        return False
+
+    return True
+
+
+def is_reasonable_quad(points, image_width: int, image_height: int):
+    rect = order_points(points)
+
+    tl, tr, br, bl = rect
+
+    width_top = np.linalg.norm(tr - tl)
+    width_bottom = np.linalg.norm(br - bl)
+    height_left = np.linalg.norm(bl - tl)
+    height_right = np.linalg.norm(br - tr)
+
+    if min(width_top, width_bottom, height_left, height_right) <= 1:
+        return False
+
+    width_ratio = max(width_top, width_bottom) / max(min(width_top, width_bottom), 1)
+    height_ratio = max(height_left, height_right) / max(min(height_left, height_right), 1)
+
+    # Nếu Gemini trả hình quá méo thì không tin
+    if width_ratio > 2.5:
+        return False
+
+    if height_ratio > 2.5:
+        return False
+
+    avg_width = (width_top + width_bottom) / 2.0
+    avg_height = (height_left + height_right) / 2.0
+
+    doc_ratio = avg_width / max(avg_height, 1)
+
+    # A4 đứng khoảng 0.707, A4 ngang khoảng 1.414.
+    # Cho rộng hơn một chút để chấp nhận ảnh chụp nghiêng.
+    if not (0.40 <= doc_ratio <= 2.20):
         return False
 
     return True
@@ -308,12 +382,12 @@ def order_points(points):
     rect = np.zeros((4, 2), dtype="float32")
 
     s = points.sum(axis=1)
-    rect[0] = points[np.argmin(s)]
-    rect[2] = points[np.argmax(s)]
+    rect[0] = points[np.argmin(s)]      # top-left
+    rect[2] = points[np.argmax(s)]      # bottom-right
 
     diff = np.diff(points, axis=1)
-    rect[1] = points[np.argmin(diff)]
-    rect[3] = points[np.argmax(diff)]
+    rect[1] = points[np.argmin(diff)]   # top-right
+    rect[3] = points[np.argmax(diff)]   # bottom-left
 
     return rect
 
@@ -362,6 +436,7 @@ def fit_image_to_a4_canvas(image, output_width: int, output_height: int):
 
 
 def enhance_document(image):
+    # Tăng tương phản nhẹ để chữ rõ hơn nhưng không làm mất màu/chi tiết.
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
 
