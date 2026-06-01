@@ -3,7 +3,7 @@ import io
 import json
 import os
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 import cv2
 import numpy as np
@@ -16,8 +16,8 @@ from google.genai import types
 
 app = FastAPI(title="Gemini Crop A4 Document API")
 
-# Mặc định A4 nhẹ hơn để chạy nhanh hơn.
-# Apps Script vẫn có thể truyền widthPx / heightPx để ghi đè.
+# A4 nhẹ hơn để chạy nhanh, đủ đọc văn bản
+# Apps Script vẫn có thể truyền widthPx / heightPx để ghi đè
 A4_WIDTH_PX = 1240
 A4_HEIGHT_PX = 1754
 
@@ -104,7 +104,7 @@ def crop_document_with_gemini(
 ):
     h, w = image.shape[:2]
 
-    gemini_result = find_document_area_with_gemini(
+    gemini_result = find_document_corners_with_gemini(
         image_bytes=image_bytes,
         mime_type=mime_type,
         image_width=w,
@@ -129,30 +129,18 @@ def crop_document_with_gemini(
 
             return warped, True, "gemini_corners", gemini_result
 
-        box = gemini_result.get("box_2d")
-
-        if is_valid_box(box, w, h):
-            x1, y1, x2, y2 = box_to_pixels(box, w, h)
-            cropped = image[y1:y2, x1:x2]
-
-            warped = resize_to_a4(cropped, output_width, output_height)
-
-            if enhance_text:
-                warped = enhance_document(warped)
-
-            return warped, True, "gemini_box", gemini_result
-
-    # Fallback an toàn: nếu Gemini lỗi, quá tải, hoặc không chắc
-    # thì KHÔNG crop bừa. Đưa nguyên ảnh vào nền A4 để tránh mất nội dung.
+    # QUAN TRỌNG:
+    # Không dùng bounding box để crop vì Gemini hay chọn vùng chữ.
+    # Nếu không có đủ 4 góc ngoài của tờ giấy thì giữ nguyên ảnh vào nền A4.
     safe = fit_image_to_a4_canvas(image, output_width, output_height)
 
     if enhance_text:
         safe = enhance_document(safe)
 
-    return safe, False, "safe_fit_full_image", gemini_result
+    return safe, False, "safe_fit_full_image_no_valid_corners", gemini_result
 
 
-def find_document_area_with_gemini(
+def find_document_corners_with_gemini(
     image_bytes: bytes,
     mime_type: str,
     image_width: int,
@@ -169,15 +157,28 @@ def find_document_area_with_gemini(
     client = genai.Client(api_key=api_key)
 
     prompt = f"""
-Bạn là hệ thống phát hiện vùng tài liệu trong ảnh chụp.
+Bạn là hệ thống phát hiện mép ngoài của tờ giấy/tài liệu trong ảnh chụp.
 
-Nhiệm vụ:
-- Tìm vùng tờ giấy hoặc tài liệu chính trong ảnh.
-- Ưu tiên trả về chính xác 4 góc thật của tài liệu nếu nhìn thấy đủ.
-- Không chọn nền bàn, tay, bóng đổ, màn hình, vật khác hoặc khung ngoài không phải tài liệu.
-- Nếu không chắc, document_found phải là false.
-- Nếu tài liệu bị nghiêng, hãy trả đúng 4 góc của tài liệu theo ảnh gốc.
-- Nếu chỉ thấy một phần tài liệu hoặc mép giấy không rõ, document_found=false.
+Nhiệm vụ chính:
+- Chỉ tìm 4 góc ngoài cùng của toàn bộ tờ giấy hoặc tài liệu chính.
+- Mục tiêu là lấy nguyên cả trang giấy, bao gồm cả lề trắng của giấy nếu có.
+- Không được chọn vùng chữ.
+- Không được chọn tiêu đề.
+- Không được chọn đoạn văn bản.
+- Không được chọn logo.
+- Không được chọn bảng biểu.
+- Không được chọn nội dung nằm bên trong giấy.
+- Không được crop sát chữ.
+- Không được chọn vùng chỉ chứa chữ lớn.
+- Không được chọn một phần trang giấy.
+
+Điều kiện bắt buộc:
+- Chỉ trả document_found=true nếu nhìn thấy rõ đủ 4 góc ngoài của tờ giấy.
+- Nếu chỉ thấy nội dung chữ nhưng không thấy rõ mép giấy, document_found=false.
+- Nếu nền và giấy trùng màu khiến mép giấy không rõ, document_found=false.
+- Nếu ảnh bị cắt mất góc giấy, document_found=false.
+- Nếu có nhiều vật thể khác trong ảnh, chỉ chọn tờ giấy/tài liệu chính.
+- Nếu không chắc chắn, document_found=false.
 
 Ảnh có kích thước:
 width={image_width}
@@ -187,7 +188,7 @@ Chỉ trả về JSON hợp lệ.
 Không markdown.
 Không giải thích ngoài JSON.
 
-Schema:
+Schema bắt buộc:
 {{
   "document_found": true,
   "confidence": 0.0,
@@ -197,20 +198,28 @@ Schema:
     [x_bottom_right, y_bottom_right],
     [x_bottom_left, y_bottom_left]
   ],
-  "box_2d": [ymin, xmin, ymax, xmax],
   "reason": "ngắn gọn"
 }}
 
 Quy định tọa độ:
+- corners là 4 góc ngoài của toàn bộ tờ giấy.
 - corners dùng tọa độ pixel thật theo ảnh gốc.
-- box_2d dùng tọa độ pixel thật theo ảnh gốc.
-- box_2d theo thứ tự [ymin, xmin, ymax, xmax].
 - Tọa độ x nằm trong khoảng 0 đến {image_width}.
 - Tọa độ y nằm trong khoảng 0 đến {image_height}.
+- Nếu document_found=false thì corners có thể là [].
+- Nếu không chắc, confidence phải dưới 0.55 và document_found=false.
+
+Ví dụ đúng:
+- Trả 4 góc ngoài của trang giấy.
+- Bao gồm cả lề trắng của tờ giấy.
+
+Ví dụ sai:
+- Chọn khung quanh chữ.
+- Chọn khung quanh tiêu đề.
+- Chọn vùng nội dung ở giữa trang.
+- Chọn vùng crop sát chữ.
 """
 
-    # Bạn có thể chỉnh danh sách này theo model tài khoản bạn dùng được.
-    # Nếu gemini-3.5-flash không tồn tại hoặc quá tải, code sẽ tự thử model tiếp theo.
     models_to_try = [
         "gemini-3.5-flash",
         "gemini-2.0-flash",
@@ -252,9 +261,16 @@ Quy định tọa độ:
 
             confidence = float(data.get("confidence", 0) or 0)
 
-            if confidence < 0.55:
+            if confidence < 0.60:
                 data["document_found"] = False
                 data["reason"] = "Confidence too low: " + str(confidence)
+
+            # Không cho dùng corners rỗng
+            if data.get("document_found") is True:
+                corners = data.get("corners")
+                if not corners or not isinstance(corners, list) or len(corners) != 4:
+                    data["document_found"] = False
+                    data["reason"] = "No valid 4 document corners returned"
 
             return data
 
@@ -299,16 +315,17 @@ def is_valid_corners(corners, image_width: int, image_height: int):
 
     area = cv2.contourArea(points)
 
-    if area < image_width * image_height * 0.08:
+    # Nếu vùng quá nhỏ, có thể Gemini đã chọn vùng chữ
+    if area < image_width * image_height * 0.18:
         return False
 
-    if not is_reasonable_quad(points, image_width, image_height):
+    if not is_reasonable_quad(points):
         return False
 
     return True
 
 
-def is_reasonable_quad(points, image_width: int, image_height: int):
+def is_reasonable_quad(points):
     rect = order_points(points)
 
     tl, tr, br, bl = rect
@@ -324,7 +341,7 @@ def is_reasonable_quad(points, image_width: int, image_height: int):
     width_ratio = max(width_top, width_bottom) / max(min(width_top, width_bottom), 1)
     height_ratio = max(height_left, height_right) / max(min(height_left, height_right), 1)
 
-    # Nếu Gemini trả hình quá méo thì không tin
+    # Nếu 4 góc tạo ra hình quá méo thì không tin
     if width_ratio > 2.5:
         return False
 
@@ -337,45 +354,11 @@ def is_reasonable_quad(points, image_width: int, image_height: int):
     doc_ratio = avg_width / max(avg_height, 1)
 
     # A4 đứng khoảng 0.707, A4 ngang khoảng 1.414.
-    # Cho rộng hơn một chút để chấp nhận ảnh chụp nghiêng.
-    if not (0.40 <= doc_ratio <= 2.20):
+    # Cho rộng hơn để chấp nhận ảnh chụp nghiêng.
+    if not (0.35 <= doc_ratio <= 2.50):
         return False
 
     return True
-
-
-def is_valid_box(box, image_width: int, image_height: int):
-    if not isinstance(box, list) or len(box) != 4:
-        return False
-
-    try:
-        ymin, xmin, ymax, xmax = [float(v) for v in box]
-    except Exception:
-        return False
-
-    if xmax <= xmin or ymax <= ymin:
-        return False
-
-    if xmin < 0 or ymin < 0 or xmax > image_width or ymax > image_height:
-        return False
-
-    area = (xmax - xmin) * (ymax - ymin)
-
-    if area < image_width * image_height * 0.08:
-        return False
-
-    return True
-
-
-def box_to_pixels(box, image_width: int, image_height: int):
-    ymin, xmin, ymax, xmax = [int(round(float(v))) for v in box]
-
-    xmin = max(0, min(xmin, image_width - 1))
-    xmax = max(1, min(xmax, image_width))
-    ymin = max(0, min(ymin, image_height - 1))
-    ymax = max(1, min(ymax, image_height))
-
-    return xmin, ymin, xmax, ymax
 
 
 def order_points(points):
@@ -408,14 +391,6 @@ def four_point_transform(image, points, output_width: int, output_height: int):
     return warped
 
 
-def resize_to_a4(image, output_width: int, output_height: int):
-    return cv2.resize(
-        image,
-        (output_width, output_height),
-        interpolation=cv2.INTER_AREA
-    )
-
-
 def fit_image_to_a4_canvas(image, output_width: int, output_height: int):
     canvas = np.ones((output_height, output_width, 3), dtype=np.uint8) * 255
 
@@ -436,11 +411,11 @@ def fit_image_to_a4_canvas(image, output_width: int, output_height: int):
 
 
 def enhance_document(image):
-    # Tăng tương phản nhẹ để chữ rõ hơn nhưng không làm mất màu/chi tiết.
+    # Tăng tương phản nhẹ để chữ rõ hơn nhưng không làm mất màu/chi tiết
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
 
-    clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
     l_channel = clahe.apply(l_channel)
 
     enhanced_lab = cv2.merge((l_channel, a_channel, b_channel))
